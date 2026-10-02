@@ -16,6 +16,13 @@ after_initialize do
       isolate_namespace IsbfViews
     end
 
+    class PostImpression < ::ActiveRecord::Base
+      self.table_name = "isbf_post_view_impressions"
+
+      belongs_to :post
+      belongs_to :user
+    end
+
     class Impression < ::ActiveRecord::Base
       self.table_name = "isbf_view_impressions"
 
@@ -86,7 +93,66 @@ after_initialize do
     end
   end
 
-  IsbfViews::Engine.routes.draw { post "/impressions" => "impressions#create" }
+  class ::IsbfViews::PostImpressionsController < ::ApplicationController
+    MAX_POSTS = 50
+    MAX_POST_ID = (2**63) - 1
+
+    requires_login
+
+    def create
+      raise Discourse::NotFound unless SiteSetting.isbf_views_enabled
+
+      raw_ids = params[:post_ids]
+      unless raw_ids.is_a?(Array) && raw_ids.length.between?(1, MAX_POSTS)
+        raise Discourse::InvalidParameters.new(:post_ids)
+      end
+
+      ids =
+        raw_ids.map do |id|
+          if id.is_a?(Integer) || (id.is_a?(String) && id.match?(/\A[1-9][0-9]*\z/))
+            Integer(id, exception: false)
+          end
+        end
+      if ids.any? { |id| !id || !id.between?(1, MAX_POST_ID) }
+        raise Discourse::InvalidParameters.new(:post_ids)
+      end
+
+      topics =
+        Topic
+          .listable_topics
+          .secured(guardian)
+          .where(archetype: Archetype.default, visible: true, deleted_at: nil)
+      visible_ids =
+        Post
+          .where(id: ids.uniq, topic_id: topics.select(:id))
+          .where(post_type: Post.types[:regular], deleted_at: nil, hidden: false)
+          .where("post_number > 1 AND user_id > 0")
+          .includes(:topic)
+          .select { |post| guardian.can_see_post?(post) }
+          .map(&:id)
+
+      counts = {}
+      if visible_ids.present?
+        now = Time.zone.now
+        rows =
+          visible_ids.map do |post_id|
+            { post_id: post_id, user_id: current_user.id, created_at: now }
+          end
+        IsbfViews::PostImpression.insert_all(
+          rows,
+          unique_by: :index_isbf_post_view_impressions_on_post_id_and_user_id,
+        )
+        counts = IsbfViews::PostImpression.where(post_id: visible_ids).group(:post_id).count
+      end
+
+      render json: { counts: visible_ids.to_h { |id| [id, counts.fetch(id, 0)] } }
+    end
+  end
+
+  IsbfViews::Engine.routes.draw do
+    post "/impressions" => "impressions#create"
+    post "/post-impressions" => "post_impressions#create"
+  end
   Discourse::Application.routes.append do
     mount ::IsbfViews::Engine, at: "/isbf/views"
   end
